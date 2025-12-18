@@ -8,85 +8,116 @@
   let { sdk }: Props = $props();
 
   // Types
-  interface RecurringTransaction {
+  interface ScheduledItem {
+    id: string;
+    series_id: string | null;
     description: string;
-    merchant_key: string;
-    amount: number; // Negative for expenses, positive for income
-    frequency: string;
-    interval_days: number;
-    occurrence_count: number;
-    last_date: string;
-    next_date: string;
-    is_income: boolean;
-    is_hidden: boolean;
+    amount: number;
+    date: string;
   }
 
-  interface ProjectedDay {
-    date: string;
+  interface Account {
+    id: string;
+    name: string;
     balance: number;
-    transactions: { description: string; amount: number }[];
-    is_danger: boolean;
+  }
+
+  interface Suggestion {
+    description: string;
+    amount: number;
+    frequency: string;
+    interval_days: number;
+    last_date: string;
+    occurrence_count: number;
+  }
+
+  interface ProjectedItem extends ScheduledItem {
+    running_balance: number;
   }
 
   // State
-  let recurringTransactions = $state<RecurringTransaction[]>([]);
-  let hiddenKeys = $state<Set<string>>(new Set());
-  let currentBalance = $state(0);
-  let projections = $state<ProjectedDay[]>([]);
+  let items = $state<ScheduledItem[]>([]);
+  let accounts = $state<Account[]>([]);
+  let selectedAccountIds = $state<Set<string>>(new Set());
+  let suggestions = $state<Suggestion[]>([]);
   let isLoading = $state(true);
-  let horizonDays = $state(60);
-  let dangerThreshold = $state(0);
+  let horizonMonths = $state(3);
   let cursorIndex = $state(0);
-  let showHidden = $state(false);
+
+  // Modal state
+  let showAddModal = $state(false);
+  let showEditModal = $state(false);
+  let editingItem = $state<ScheduledItem | null>(null);
+
+  // Form state
+  let formDescription = $state("");
+  let formAmount = $state("");
+  let formIsIncome = $state(false);
+  let formScheduleType = $state<"once" | "recurring">("once");
+  let formDate = $state("");
+  let formFrequency = $state("monthly");
+  let formStartDate = $state("");
+  let formDurationMonths = $state(3);
 
   // Refs
   let containerEl = $state<HTMLDivElement | null>(null);
 
   // Computed
-  let visibleTransactions = $derived(
-    recurringTransactions.filter(t => showHidden || !t.is_hidden)
+  let startingBalance = $derived(
+    accounts
+      .filter(a => selectedAccountIds.has(a.id))
+      .reduce((sum, a) => sum + a.balance, 0)
   );
 
-  let incomeTransactions = $derived(
-    visibleTransactions.filter(t => t.is_income && !t.is_hidden)
-  );
+  let projectedItems = $derived.by(() => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
 
-  let expenseTransactions = $derived(
-    visibleTransactions.filter(t => !t.is_income && !t.is_hidden)
-  );
+    const horizonDate = new Date(today);
+    horizonDate.setMonth(horizonDate.getMonth() + horizonMonths);
 
-  let monthlyIncome = $derived(
-    incomeTransactions.reduce((sum, t) => sum + (t.amount * 30 / t.interval_days), 0)
-  );
+    // Filter items within horizon and sort by date
+    const filtered = items
+      .filter(item => {
+        const itemDate = new Date(item.date);
+        return itemDate >= today && itemDate <= horizonDate;
+      })
+      .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
 
-  let monthlyExpenses = $derived(
-    expenseTransactions.reduce((sum, t) => sum + (Math.abs(t.amount) * 30 / t.interval_days), 0)
-  );
-
-  let monthlyNet = $derived(monthlyIncome - monthlyExpenses);
-
-  let projectedBalance = $derived(
-    projections.length > 0 ? projections[projections.length - 1].balance : currentBalance
-  );
-
-  let lowestBalance = $derived(
-    projections.length > 0 ? Math.min(...projections.map(p => p.balance)) : currentBalance
-  );
-
-  let dangerDate = $derived(() => {
-    const danger = projections.find(p => p.balance < dangerThreshold);
-    return danger?.date || null;
+    // Calculate running balance
+    let balance = startingBalance;
+    return filtered.map(item => {
+      balance = Math.round((balance + item.amount) * 100) / 100;
+      return { ...item, running_balance: balance };
+    });
   });
 
-  let upcomingTransactions = $derived(
-    projections
-      .flatMap(p => p.transactions.map(t => ({ ...t, date: p.date })))
-      .slice(0, 15)
+  let lowestBalance = $derived(
+    projectedItems.length > 0
+      ? Math.min(startingBalance, ...projectedItems.map(p => p.running_balance))
+      : startingBalance
   );
 
-  let selectedTransaction = $derived(
-    cursorIndex < visibleTransactions.length ? visibleTransactions[cursorIndex] : null
+  let endingBalance = $derived(
+    projectedItems.length > 0
+      ? projectedItems[projectedItems.length - 1].running_balance
+      : startingBalance
   );
+
+  let totalIncome = $derived(
+    projectedItems.filter(p => p.amount > 0).reduce((sum, p) => sum + p.amount, 0)
+  );
+
+  let totalExpenses = $derived(
+    projectedItems.filter(p => p.amount < 0).reduce((sum, p) => sum + Math.abs(p.amount), 0)
+  );
+
+  let selectedItem = $derived(
+    cursorIndex < projectedItems.length ? projectedItems[cursorIndex] : null
+  );
+
+  // Check if in demo mode (for reset button)
+  let isDemoMode = $state(false);
 
   // Lifecycle
   let unsubscribe: (() => void) | null = null;
@@ -96,10 +127,19 @@
       loadData();
     });
 
-    await ensureTables();
-    await loadSettings();
-    await loadHiddenKeys();
-    await loadData();
+    // Check demo mode
+    try {
+      const result = await sdk.query<any>("SELECT 1 FROM sys_config WHERE key = 'demo_mode' AND value = 'true'");
+      isDemoMode = result.length > 0;
+    } catch {
+      isDemoMode = false;
+    }
+
+    await ensureTable();
+    await loadAccounts();
+    await loadItems();
+    await loadSuggestions();
+    isLoading = false;
 
     containerEl?.focus();
   });
@@ -109,58 +149,74 @@
   });
 
   // Database
-  async function ensureTables() {
+  async function ensureTable() {
     try {
       await sdk.execute(`
-        CREATE TABLE IF NOT EXISTS sys_plugin_treeline_cashflow_hidden (
-          merchant_key VARCHAR PRIMARY KEY,
-          hidden_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        CREATE TABLE IF NOT EXISTS sys_plugin_treeline_cashflow_items (
+          id VARCHAR PRIMARY KEY,
+          series_id VARCHAR,
+          description VARCHAR NOT NULL,
+          amount DECIMAL(12,2) NOT NULL,
+          date DATE NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
       `);
       await sdk.execute(`
-        CREATE TABLE IF NOT EXISTS sys_plugin_treeline_cashflow_scheduled (
-          id VARCHAR PRIMARY KEY,
-          description VARCHAR NOT NULL,
-          amount DECIMAL(12,2) NOT NULL,
-          frequency VARCHAR NOT NULL,
-          next_date DATE NOT NULL,
-          end_date DATE,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
+        CREATE INDEX IF NOT EXISTS idx_cashflow_items_date
+        ON sys_plugin_treeline_cashflow_items(date)
+      `);
+      await sdk.execute(`
+        CREATE INDEX IF NOT EXISTS idx_cashflow_items_series
+        ON sys_plugin_treeline_cashflow_items(series_id)
       `);
     } catch (e) {
       // Tables may already exist
     }
   }
 
-  async function loadSettings() {
-    try {
-      const savedHorizon = await sdk.settings.get("horizonDays");
-      if (savedHorizon && typeof savedHorizon === "number") {
-        horizonDays = savedHorizon;
-      }
-      const savedThreshold = await sdk.settings.get("dangerThreshold");
-      if (savedThreshold && typeof savedThreshold === "number") {
-        dangerThreshold = savedThreshold;
-      }
-    } catch (e) {
-      // Use defaults
-    }
-  }
-
-  async function loadHiddenKeys() {
+  async function loadAccounts() {
     try {
       const rows = await sdk.query<any>(
-        "SELECT merchant_key FROM sys_plugin_treeline_cashflow_hidden"
+        "SELECT account_id, account_name, balance FROM sys_accounts ORDER BY account_name"
       );
-      hiddenKeys = new Set(rows.map((r: any) => r[0] as string).filter(Boolean));
+      accounts = rows.map((r: any) => ({
+        id: r[0] as string,
+        name: r[1] as string,
+        balance: r[2] as number,
+      }));
+
+      // Load saved selection or default to all
+      const savedSelection = await sdk.settings.get("selectedAccountIds");
+      if (savedSelection && Array.isArray(savedSelection)) {
+        selectedAccountIds = new Set(savedSelection);
+      } else if (accounts.length > 0) {
+        // Default to first account (usually checking)
+        selectedAccountIds = new Set([accounts[0].id]);
+      }
     } catch (e) {
-      // Table might not exist yet
+      console.error("Failed to load accounts", e);
     }
   }
 
-  // SQL for detecting recurring transactions (income + expenses)
-  const RECURRING_SQL = `WITH base_transactions AS (
+  async function loadItems() {
+    try {
+      const rows = await sdk.query<any>(
+        "SELECT id, series_id, description, amount, date FROM sys_plugin_treeline_cashflow_items ORDER BY date"
+      );
+      items = rows.map((r: any) => ({
+        id: r[0] as string,
+        series_id: r[1] as string | null,
+        description: r[2] as string,
+        amount: r[3] as number,
+        date: r[4] as string,
+      }));
+    } catch (e) {
+      console.error("Failed to load items", e);
+    }
+  }
+
+  // Auto-detection SQL for suggestions
+  const SUGGESTION_SQL = `WITH base_transactions AS (
   SELECT
     ROUND(amount, 2) as norm_amount,
     UPPER(description) as upper_desc,
@@ -168,8 +224,7 @@
     amount,
     transaction_date
   FROM transactions
-  WHERE description IS NOT NULL
-    AND description != ''
+  WHERE description IS NOT NULL AND description != ''
 ),
 canonical_merchants AS (
   SELECT DISTINCT ON (norm_amount)
@@ -219,13 +274,11 @@ merchant_intervals AS (
 merchant_stats AS (
   SELECT
     FIRST(mi.merchant) as description,
-    mi.merchant_group as merchant_key,
     AVG(mi.amount) as avg_amount,
     COUNT(*) + 1 as occurrence_count,
     AVG(mi.interval_days) as avg_interval,
     STDDEV(mi.interval_days) as stddev_interval,
-    MAX(mi.transaction_date) as last_date,
-    DATEDIFF('day', MAX(mi.transaction_date), CURRENT_DATE) as days_since_last
+    MAX(mi.transaction_date) as last_date
   FROM merchant_intervals mi
   GROUP BY mi.merchant_group, mi.norm_amount
   HAVING
@@ -233,190 +286,215 @@ merchant_stats AS (
     AND AVG(mi.interval_days) BETWEEN 5 AND 400
     AND STDDEV(mi.interval_days) < AVG(mi.interval_days) * 0.5
 )
-SELECT
-  description,
-  merchant_key,
-  avg_amount,
-  occurrence_count,
-  avg_interval,
-  last_date,
-  days_since_last
+SELECT description, avg_amount, occurrence_count, avg_interval, last_date
 FROM merchant_stats
-ORDER BY ABS(avg_amount) DESC`;
+ORDER BY ABS(avg_amount) DESC
+LIMIT 20`;
 
-  async function loadData() {
-    isLoading = true;
+  async function loadSuggestions() {
     try {
-      // Get current total balance
-      const balanceRows = await sdk.query<any>(
-        "SELECT COALESCE(SUM(balance), 0) as total FROM sys_accounts"
-      );
-      currentBalance = Math.round((balanceRows[0]?.[0] as number || 0) * 100) / 100;
-
-      // Load recurring transactions
-      const rows = await sdk.query<any>(RECURRING_SQL);
-
-      recurringTransactions = rows.map((row: any) => {
-        const description = row[0] as string || "";
-        const merchant_key = row[1] as string || description.toUpperCase();
-        const avg_amount = row[2] as number;
-        const occurrence_count = row[3] as number;
-        const avg_interval = row[4] as number;
-        const last_date = row[5] as string;
-        const days_since_last = row[6] as number;
-
-        const interval_days = Math.round(avg_interval);
+      const rows = await sdk.query<any>(SUGGESTION_SQL);
+      suggestions = rows.map((r: any) => {
+        const interval = Math.round(r[3] as number);
         let frequency = "monthly";
-        if (interval_days <= 8) frequency = "weekly";
-        else if (interval_days <= 16) frequency = "biweekly";
-        else if (interval_days <= 35) frequency = "monthly";
-        else if (interval_days <= 100) frequency = "quarterly";
+        if (interval <= 8) frequency = "weekly";
+        else if (interval <= 16) frequency = "biweekly";
+        else if (interval <= 35) frequency = "monthly";
+        else if (interval <= 100) frequency = "quarterly";
         else frequency = "annual";
 
-        // Calculate next expected date
-        const lastDateObj = new Date(last_date);
-        const nextDateObj = new Date(lastDateObj);
-        nextDateObj.setDate(nextDateObj.getDate() + interval_days);
-
-        // If next date is in the past, move forward
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
-        while (nextDateObj < today) {
-          nextDateObj.setDate(nextDateObj.getDate() + interval_days);
-        }
-
         return {
-          description,
-          merchant_key,
-          amount: Math.round(avg_amount * 100) / 100,
+          description: r[0] as string,
+          amount: Math.round((r[1] as number) * 100) / 100,
+          occurrence_count: r[2] as number,
+          interval_days: interval,
           frequency,
-          interval_days,
-          occurrence_count,
-          last_date,
-          next_date: nextDateObj.toISOString().split('T')[0],
-          is_income: avg_amount > 0,
-          is_hidden: hiddenKeys.has(merchant_key),
+          last_date: r[4] as string,
         };
       });
-
-      // Generate projections
-      generateProjections();
     } catch (e) {
-      sdk.toast.error("Failed to load data", e instanceof Error ? e.message : String(e));
-    } finally {
-      isLoading = false;
+      console.error("Failed to load suggestions", e);
     }
-  }
-
-  function generateProjections() {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-
-    let balance = currentBalance;
-    const days: ProjectedDay[] = [];
-
-    // Get active (non-hidden) recurring transactions
-    const activeRecurring = recurringTransactions.filter(t => !hiddenKeys.has(t.merchant_key));
-
-    for (let i = 0; i <= horizonDays; i++) {
-      const date = new Date(today);
-      date.setDate(date.getDate() + i);
-      const dateStr = date.toISOString().split('T')[0];
-
-      // Find transactions occurring on this day
-      const dayTransactions: { description: string; amount: number }[] = [];
-
-      for (const txn of activeRecurring) {
-        const nextDate = new Date(txn.next_date);
-        nextDate.setHours(0, 0, 0, 0);
-
-        // Check if this transaction occurs on this day
-        let checkDate = new Date(nextDate);
-        while (checkDate <= date) {
-          if (checkDate.toISOString().split('T')[0] === dateStr) {
-            dayTransactions.push({
-              description: txn.description,
-              amount: txn.amount,
-            });
-            break;
-          }
-          checkDate.setDate(checkDate.getDate() + txn.interval_days);
-        }
-      }
-
-      // Update balance
-      const dayTotal = dayTransactions.reduce((sum, t) => sum + t.amount, 0);
-      balance = Math.round((balance + dayTotal) * 100) / 100;
-
-      days.push({
-        date: dateStr,
-        balance,
-        transactions: dayTransactions,
-        is_danger: balance < dangerThreshold,
-      });
-    }
-
-    projections = days;
   }
 
   // Actions
-  async function hideTransaction(txn: RecurringTransaction) {
+  async function toggleAccount(accountId: string) {
+    const newSelection = new Set(selectedAccountIds);
+    if (newSelection.has(accountId)) {
+      newSelection.delete(accountId);
+    } else {
+      newSelection.add(accountId);
+    }
+    selectedAccountIds = newSelection;
+    await sdk.settings.set("selectedAccountIds", Array.from(newSelection));
+  }
+
+  function openAddModal(suggestion?: Suggestion) {
+    if (suggestion) {
+      formDescription = suggestion.description;
+      formAmount = Math.abs(suggestion.amount).toString();
+      formIsIncome = suggestion.amount > 0;
+      formScheduleType = "recurring";
+      formFrequency = suggestion.frequency;
+      // Calculate next expected date
+      const lastDate = new Date(suggestion.last_date);
+      lastDate.setDate(lastDate.getDate() + suggestion.interval_days);
+      const today = new Date();
+      while (lastDate < today) {
+        lastDate.setDate(lastDate.getDate() + suggestion.interval_days);
+      }
+      formStartDate = lastDate.toISOString().split('T')[0];
+      formDurationMonths = 3;
+    } else {
+      formDescription = "";
+      formAmount = "";
+      formIsIncome = false;
+      formScheduleType = "once";
+      formDate = new Date().toISOString().split('T')[0];
+      formFrequency = "monthly";
+      formStartDate = new Date().toISOString().split('T')[0];
+      formDurationMonths = 3;
+    }
+    showAddModal = true;
+  }
+
+  function closeAddModal() {
+    showAddModal = false;
+  }
+
+  function generateId(): string {
+    return crypto.randomUUID();
+  }
+
+  async function saveNewItem() {
+    if (!formDescription.trim() || !formAmount) {
+      sdk.toast.error("Please fill in description and amount");
+      return;
+    }
+
+    const amount = parseFloat(formAmount) * (formIsIncome ? 1 : -1);
+
     try {
-      const escaped = txn.merchant_key.replace(/'/g, "''");
-      await sdk.execute(`
-        INSERT INTO sys_plugin_treeline_cashflow_hidden (merchant_key, hidden_at)
-        VALUES ('${escaped}', CURRENT_TIMESTAMP)
-        ON CONFLICT (merchant_key) DO UPDATE SET hidden_at = CURRENT_TIMESTAMP
-      `);
-      hiddenKeys = new Set([...hiddenKeys, txn.merchant_key]);
-      // Update the transaction in place
-      recurringTransactions = recurringTransactions.map(t =>
-        t.merchant_key === txn.merchant_key ? { ...t, is_hidden: true } : t
-      );
-      generateProjections();
-      sdk.toast.info("Hidden", `"${txn.description}" excluded from projections`);
+      if (formScheduleType === "once") {
+        // Single item
+        const id = generateId();
+        const escaped = formDescription.replace(/'/g, "''");
+        await sdk.execute(`
+          INSERT INTO sys_plugin_treeline_cashflow_items (id, series_id, description, amount, date)
+          VALUES ('${id}', NULL, '${escaped}', ${amount}, '${formDate}')
+        `);
+      } else {
+        // Recurring - generate multiple items with same series_id
+        const seriesId = generateId();
+        const startDate = new Date(formStartDate);
+        const endDate = new Date(startDate);
+        endDate.setMonth(endDate.getMonth() + formDurationMonths);
+
+        const intervalDays = getIntervalDays(formFrequency);
+        const escaped = formDescription.replace(/'/g, "''");
+
+        let currentDate = new Date(startDate);
+        while (currentDate <= endDate) {
+          const id = generateId();
+          const dateStr = currentDate.toISOString().split('T')[0];
+          await sdk.execute(`
+            INSERT INTO sys_plugin_treeline_cashflow_items (id, series_id, description, amount, date)
+            VALUES ('${id}', '${seriesId}', '${escaped}', ${amount}, '${dateStr}')
+          `);
+          currentDate.setDate(currentDate.getDate() + intervalDays);
+        }
+      }
+
+      await loadItems();
+      closeAddModal();
+      sdk.toast.success("Added", formDescription);
     } catch (e) {
-      sdk.toast.error("Failed to hide", e instanceof Error ? e.message : String(e));
+      sdk.toast.error("Failed to add", e instanceof Error ? e.message : String(e));
     }
   }
 
-  async function unhideTransaction(txn: RecurringTransaction) {
-    try {
-      const escaped = txn.merchant_key.replace(/'/g, "''");
-      await sdk.execute(`
-        DELETE FROM sys_plugin_treeline_cashflow_hidden WHERE merchant_key = '${escaped}'
-      `);
-      const newHidden = new Set(hiddenKeys);
-      newHidden.delete(txn.merchant_key);
-      hiddenKeys = newHidden;
-      recurringTransactions = recurringTransactions.map(t =>
-        t.merchant_key === txn.merchant_key ? { ...t, is_hidden: false } : t
-      );
-      generateProjections();
-      sdk.toast.info("Restored", `"${txn.description}" included in projections`);
-    } catch (e) {
-      sdk.toast.error("Failed to restore", e instanceof Error ? e.message : String(e));
+  function getIntervalDays(frequency: string): number {
+    switch (frequency) {
+      case "weekly": return 7;
+      case "biweekly": return 14;
+      case "monthly": return 30;
+      case "quarterly": return 91;
+      case "annual": return 365;
+      default: return 30;
     }
   }
 
-  async function setHorizon(days: number) {
-    horizonDays = days;
-    await sdk.settings.set("horizonDays", days);
-    generateProjections();
+  function openEditModal(item: ScheduledItem) {
+    editingItem = item;
+    formDescription = item.description;
+    formAmount = Math.abs(item.amount).toString();
+    formIsIncome = item.amount > 0;
+    formDate = item.date;
+    showEditModal = true;
   }
 
-  function viewSQL() {
-    sdk.openView("query", { initialQuery: RECURRING_SQL });
+  function closeEditModal() {
+    showEditModal = false;
+    editingItem = null;
   }
 
-  function viewTransactions(description: string) {
-    const escaped = description.replace(/'/g, "''");
-    sdk.openView("query", {
-      initialQuery: `SELECT transaction_date, description, amount
-FROM transactions
-WHERE description = '${escaped}'
-ORDER BY transaction_date DESC`
-    });
+  async function saveEditedItem() {
+    if (!editingItem) return;
+
+    const amount = parseFloat(formAmount) * (formIsIncome ? 1 : -1);
+    const escaped = formDescription.replace(/'/g, "''");
+
+    try {
+      await sdk.execute(`
+        UPDATE sys_plugin_treeline_cashflow_items
+        SET description = '${escaped}', amount = ${amount}, date = '${formDate}'
+        WHERE id = '${editingItem.id}'
+      `);
+      await loadItems();
+      closeEditModal();
+      sdk.toast.success("Updated", formDescription);
+    } catch (e) {
+      sdk.toast.error("Failed to update", e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function deleteItem(item: ScheduledItem, deleteAll: boolean = false) {
+    try {
+      if (deleteAll && item.series_id) {
+        await sdk.execute(`
+          DELETE FROM sys_plugin_treeline_cashflow_items
+          WHERE series_id = '${item.series_id}'
+        `);
+        sdk.toast.success("Deleted series", item.description);
+      } else {
+        await sdk.execute(`
+          DELETE FROM sys_plugin_treeline_cashflow_items
+          WHERE id = '${item.id}'
+        `);
+        sdk.toast.success("Deleted", item.description);
+      }
+      await loadItems();
+    } catch (e) {
+      sdk.toast.error("Failed to delete", e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function resetPluginData() {
+    if (!confirm("This will delete all scheduled items. Are you sure?")) return;
+
+    try {
+      await sdk.execute("DROP TABLE IF EXISTS sys_plugin_treeline_cashflow_items");
+      await ensureTable();
+      items = [];
+      sdk.toast.success("Plugin data reset");
+    } catch (e) {
+      sdk.toast.error("Failed to reset", e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function setHorizon(months: number) {
+    horizonMonths = months;
+    await sdk.settings.set("horizonMonths", months);
   }
 
   // Formatting
@@ -429,7 +507,7 @@ ORDER BY transaction_date DESC`
     }).format(amount);
   }
 
-  function formatCurrencyPrecise(amount: number): string {
+  function formatCurrencyFull(amount: number): string {
     return new Intl.NumberFormat("en-US", {
       style: "currency",
       currency: "USD",
@@ -437,14 +515,14 @@ ORDER BY transaction_date DESC`
   }
 
   function formatDate(dateStr: string): string {
-    return new Date(dateStr).toLocaleDateString("en-US", {
+    return new Date(dateStr + 'T00:00:00').toLocaleDateString("en-US", {
       month: "short",
       day: "numeric",
     });
   }
 
-  function formatDateFull(dateStr: string): string {
-    return new Date(dateStr).toLocaleDateString("en-US", {
+  function formatDateLong(dateStr: string): string {
+    return new Date(dateStr + 'T00:00:00').toLocaleDateString("en-US", {
       weekday: "short",
       month: "short",
       day: "numeric",
@@ -453,59 +531,44 @@ ORDER BY transaction_date DESC`
 
   // Keyboard navigation
   function handleKeyDown(e: KeyboardEvent) {
+    if (showAddModal || showEditModal) return;
+
     switch (e.key) {
       case "j":
       case "ArrowDown":
         e.preventDefault();
-        cursorIndex = Math.min(cursorIndex + 1, visibleTransactions.length - 1);
+        cursorIndex = Math.min(cursorIndex + 1, projectedItems.length - 1);
         break;
       case "k":
       case "ArrowUp":
         e.preventDefault();
         cursorIndex = Math.max(cursorIndex - 1, 0);
         break;
+      case "a":
+        e.preventDefault();
+        openAddModal();
+        break;
       case "Enter":
-        if (selectedTransaction) {
+      case "e":
+        if (selectedItem) {
           e.preventDefault();
-          viewTransactions(selectedTransaction.description);
+          openEditModal(selectedItem);
         }
         break;
-      case "h":
-        if (selectedTransaction) {
+      case "d":
+      case "Backspace":
+        if (selectedItem) {
           e.preventDefault();
-          if (selectedTransaction.is_hidden) {
-            unhideTransaction(selectedTransaction);
-          } else {
-            hideTransaction(selectedTransaction);
-          }
+          deleteItem(selectedItem, e.shiftKey);
         }
-        break;
-      case "1":
-        e.preventDefault();
-        setHorizon(30);
-        break;
-      case "2":
-        e.preventDefault();
-        setHorizon(60);
-        break;
-      case "3":
-        e.preventDefault();
-        setHorizon(90);
         break;
     }
   }
 
   // Keep cursor in bounds
   $effect(() => {
-    if (cursorIndex >= visibleTransactions.length) {
-      cursorIndex = Math.max(0, visibleTransactions.length - 1);
-    }
-  });
-
-  // Regenerate projections when hidden keys change
-  $effect(() => {
-    if (!isLoading && recurringTransactions.length > 0) {
-      generateProjections();
+    if (cursorIndex >= projectedItems.length) {
+      cursorIndex = Math.max(0, projectedItems.length - 1);
     }
   });
 </script>
@@ -521,151 +584,110 @@ ORDER BY transaction_date DESC`
   <header class="header">
     <div class="title-row">
       <h1 class="title">Cash Flow</h1>
-      {#if !isLoading}
-        <span class="count-badge">{incomeTransactions.length} income</span>
-        <span class="count-badge expense">{expenseTransactions.length} expenses</span>
-        {#if hiddenKeys.size > 0}
-          <span class="hidden-badge">{hiddenKeys.size} hidden</span>
-        {/if}
-      {/if}
       <div class="header-spacer"></div>
-      <button class="sql-link" onclick={viewSQL}>View SQL</button>
-      <button class="refresh-btn" onclick={() => loadData()} disabled={isLoading}>
-        Refresh
-      </button>
+      {#if isDemoMode}
+        <button class="reset-btn" onclick={resetPluginData}>Reset Data</button>
+      {/if}
+      <button class="add-btn" onclick={() => openAddModal()}>+ Add</button>
     </div>
 
-    {#if !isLoading && recurringTransactions.length > 0}
-      <div class="hero-cards">
-        <div class="hero-card">
-          <span class="hero-label">Current Balance</span>
-          <span class="hero-value">{formatCurrency(currentBalance)}</span>
-        </div>
-        <div class="hero-card">
-          <span class="hero-label">Projected ({horizonDays}d)</span>
-          <span class="hero-value" class:danger={projectedBalance < dangerThreshold}>
-            {formatCurrency(projectedBalance)}
-          </span>
-        </div>
-        <div class="hero-card">
-          <span class="hero-label">Lowest Point</span>
-          <span class="hero-value" class:danger={lowestBalance < dangerThreshold}>
-            {formatCurrency(lowestBalance)}
-          </span>
-        </div>
-        <div class="hero-card">
-          <span class="hero-label">Monthly Net</span>
-          <span class="hero-value" class:positive={monthlyNet > 0} class:negative={monthlyNet < 0}>
-            {monthlyNet >= 0 ? '+' : ''}{formatCurrency(monthlyNet)}
-          </span>
-        </div>
-      </div>
-
-      <div class="horizon-selector">
-        <span class="horizon-label">Horizon:</span>
-        <button class:active={horizonDays === 30} onclick={() => setHorizon(30)}>30d</button>
-        <button class:active={horizonDays === 60} onclick={() => setHorizon(60)}>60d</button>
-        <button class:active={horizonDays === 90} onclick={() => setHorizon(90)}>90d</button>
-      </div>
-    {/if}
+    <!-- Account Selector -->
+    <div class="account-selector">
+      <span class="account-label">Accounts:</span>
+      {#each accounts as account}
+        <button
+          class="account-chip"
+          class:selected={selectedAccountIds.has(account.id)}
+          onclick={() => toggleAccount(account.id)}
+        >
+          {account.name}
+        </button>
+      {/each}
+      <span class="balance-display">
+        Balance: <strong>{formatCurrency(startingBalance)}</strong>
+      </span>
+    </div>
   </header>
+
+  <!-- Summary Cards -->
+  {#if !isLoading}
+    <div class="summary-cards">
+      <div class="summary-card">
+        <span class="card-label">Current</span>
+        <span class="card-value">{formatCurrency(startingBalance)}</span>
+      </div>
+      <div class="summary-card">
+        <span class="card-label">Lowest</span>
+        <span class="card-value" class:danger={lowestBalance < 0}>
+          {formatCurrency(lowestBalance)}
+        </span>
+      </div>
+      <div class="summary-card">
+        <span class="card-label">After {horizonMonths}mo</span>
+        <span class="card-value">{formatCurrency(endingBalance)}</span>
+      </div>
+      <div class="summary-card">
+        <span class="card-label">Income</span>
+        <span class="card-value positive">+{formatCurrency(totalIncome)}</span>
+      </div>
+      <div class="summary-card">
+        <span class="card-label">Expenses</span>
+        <span class="card-value negative">-{formatCurrency(totalExpenses)}</span>
+      </div>
+      <div class="horizon-selector">
+        <button class:active={horizonMonths === 3} onclick={() => setHorizon(3)}>3mo</button>
+        <button class:active={horizonMonths === 6} onclick={() => setHorizon(6)}>6mo</button>
+        <button class:active={horizonMonths === 12} onclick={() => setHorizon(12)}>1yr</button>
+      </div>
+    </div>
+  {/if}
 
   <!-- Main Content -->
   <div class="main-content">
     {#if isLoading}
       <div class="loading">
         <div class="spinner"></div>
-        <span>Analyzing transactions...</span>
+        <span>Loading...</span>
       </div>
-    {:else if recurringTransactions.length === 0}
+    {:else if projectedItems.length === 0}
       <div class="empty">
-        <p class="empty-message">No recurring transactions detected.</p>
-        <p class="empty-hint">Cash flow projections require regular income/expense patterns (3+ occurrences).</p>
+        <p class="empty-title">No scheduled items</p>
+        <p class="empty-hint">Add your expected income and expenses to see your cash flow projection.</p>
+        <button class="empty-add-btn" onclick={() => openAddModal()}>+ Add First Item</button>
       </div>
     {:else}
-      <div class="split-view">
-        <!-- Left: Upcoming Transactions -->
-        <div class="upcoming-section">
-          <h2 class="section-title">Upcoming Transactions</h2>
-          {#if upcomingTransactions.length === 0}
-            <p class="empty-hint">No upcoming transactions in the next {horizonDays} days</p>
-          {:else}
-            <div class="upcoming-list">
-              {#each upcomingTransactions as txn}
-                <div class="upcoming-item" class:income={txn.amount > 0}>
-                  <span class="upcoming-date">{formatDateFull(txn.date)}</span>
-                  <span class="upcoming-desc">{txn.description}</span>
-                  <span class="upcoming-amount" class:positive={txn.amount > 0}>
-                    {txn.amount > 0 ? '+' : ''}{formatCurrencyPrecise(txn.amount)}
-                  </span>
-                </div>
-              {/each}
-            </div>
-          {/if}
+      <div class="projection-table">
+        <div class="table-header">
+          <span class="col-date">Date</span>
+          <span class="col-desc">Description</span>
+          <span class="col-amount">Amount</span>
+          <span class="col-balance">Balance</span>
         </div>
-
-        <!-- Right: Recurring Items -->
-        <div class="recurring-section">
-          <div class="section-header">
-            <h2 class="section-title">Detected Recurring</h2>
-            <button
-              class="toggle-hidden"
-              class:active={showHidden}
-              onclick={() => showHidden = !showHidden}
+        <div class="table-body">
+          {#each projectedItems as item, i}
+            <div
+              class="table-row"
+              class:selected={i === cursorIndex}
+              class:income={item.amount > 0}
+              class:series={item.series_id !== null}
+              onclick={() => cursorIndex = i}
+              ondblclick={() => openEditModal(item)}
+              role="button"
+              tabindex="0"
             >
-              {showHidden ? 'Hide hidden' : 'Show hidden'}
-            </button>
-          </div>
-
-          <div class="recurring-list">
-            {#each visibleTransactions as txn, i}
-              <div
-                class="recurring-item"
-                class:selected={i === cursorIndex}
-                class:hidden={txn.is_hidden}
-                class:income={txn.is_income}
-                onclick={() => cursorIndex = i}
-                ondblclick={() => viewTransactions(txn.description)}
-              >
-                <div class="recurring-main">
-                  <span class="recurring-desc">{txn.description}</span>
-                  <span class="recurring-freq">{txn.frequency}</span>
-                </div>
-                <div class="recurring-meta">
-                  <span class="recurring-amount" class:positive={txn.is_income}>
-                    {txn.is_income ? '+' : ''}{formatCurrencyPrecise(txn.amount)}
-                  </span>
-                  <span class="recurring-next">Next: {formatDate(txn.next_date)}</span>
-                </div>
-                {#if i === cursorIndex}
-                  <div class="recurring-actions">
-                    {#if txn.is_hidden}
-                      <button onclick={() => unhideTransaction(txn)}>Restore</button>
-                    {:else}
-                      <button onclick={() => hideTransaction(txn)}>Hide</button>
-                    {/if}
-                    <button onclick={() => viewTransactions(txn.description)}>View</button>
-                  </div>
+              <span class="col-date">{formatDateLong(item.date)}</span>
+              <span class="col-desc">
+                {item.description}
+                {#if item.series_id}
+                  <span class="series-badge">recurring</span>
                 {/if}
-              </div>
-            {/each}
-          </div>
-        </div>
-      </div>
-
-      <!-- Balance Timeline -->
-      <div class="timeline-section">
-        <h2 class="section-title">Balance Timeline</h2>
-        <div class="timeline">
-          {#each projections.filter((_, i) => i % Math.ceil(horizonDays / 10) === 0 || i === projections.length - 1) as day}
-            <div class="timeline-point" class:danger={day.is_danger}>
-              <span class="timeline-date">{formatDate(day.date)}</span>
-              <span class="timeline-balance">{formatCurrency(day.balance)}</span>
-              {#if day.transactions.length > 0}
-                <span class="timeline-txns">
-                  {day.transactions.length} txn{day.transactions.length > 1 ? 's' : ''}
-                </span>
-              {/if}
+              </span>
+              <span class="col-amount" class:positive={item.amount > 0}>
+                {item.amount > 0 ? '+' : ''}{formatCurrencyFull(item.amount)}
+              </span>
+              <span class="col-balance" class:danger={item.running_balance < 0}>
+                {formatCurrency(item.running_balance)}
+              </span>
             </div>
           {/each}
         </div>
@@ -675,12 +697,172 @@ ORDER BY transaction_date DESC`
 
   <!-- Keyboard Hints -->
   <footer class="keyboard-hints">
-    <span class="hint"><kbd>j</kbd><kbd>k</kbd> nav</span>
-    <span class="hint"><kbd>Enter</kbd> view txns</span>
-    <span class="hint"><kbd>h</kbd> hide/restore</span>
-    <span class="hint"><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> horizon</span>
+    <span class="hint"><kbd>j</kbd><kbd>k</kbd> navigate</span>
+    <span class="hint"><kbd>a</kbd> add</span>
+    <span class="hint"><kbd>e</kbd> edit</span>
+    <span class="hint"><kbd>d</kbd> delete</span>
+    <span class="hint"><kbd>⇧d</kbd> delete series</span>
   </footer>
 </div>
+
+<!-- Add Modal -->
+{#if showAddModal}
+  <div class="modal-backdrop" onclick={closeAddModal} role="dialog">
+    <div class="modal" onclick={(e) => e.stopPropagation()} role="document">
+      <div class="modal-header">
+        <h2>Add Scheduled Item</h2>
+        <button class="modal-close" onclick={closeAddModal}>×</button>
+      </div>
+
+      <!-- Suggestions -->
+      {#if suggestions.length > 0}
+        <div class="suggestions-section">
+          <h3 class="suggestions-title">Start from detected pattern:</h3>
+          <div class="suggestions-list">
+            {#each suggestions.slice(0, 8) as suggestion}
+              <button class="suggestion-item" onclick={() => openAddModal(suggestion)}>
+                <span class="suggestion-desc">{suggestion.description}</span>
+                <span class="suggestion-amount" class:positive={suggestion.amount > 0}>
+                  {suggestion.amount > 0 ? '+' : ''}{formatCurrencyFull(suggestion.amount)}
+                </span>
+                <span class="suggestion-freq">~{suggestion.frequency}</span>
+              </button>
+            {/each}
+          </div>
+        </div>
+      {/if}
+
+      <div class="modal-form">
+        <div class="form-group">
+          <label>Description</label>
+          <input type="text" bind:value={formDescription} placeholder="e.g., Rent, Paycheck" />
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label>Amount</label>
+            <input type="number" bind:value={formAmount} placeholder="0.00" step="0.01" />
+          </div>
+          <div class="form-group type-toggle">
+            <label>Type</label>
+            <div class="toggle-buttons">
+              <button class:active={!formIsIncome} onclick={() => formIsIncome = false}>Expense</button>
+              <button class:active={formIsIncome} onclick={() => formIsIncome = true}>Income</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>Schedule</label>
+          <div class="toggle-buttons">
+            <button class:active={formScheduleType === "once"} onclick={() => formScheduleType = "once"}>
+              One-time
+            </button>
+            <button class:active={formScheduleType === "recurring"} onclick={() => formScheduleType = "recurring"}>
+              Recurring
+            </button>
+          </div>
+        </div>
+
+        {#if formScheduleType === "once"}
+          <div class="form-group">
+            <label>Date</label>
+            <input type="date" bind:value={formDate} />
+          </div>
+        {:else}
+          <div class="form-row">
+            <div class="form-group">
+              <label>Frequency</label>
+              <select bind:value={formFrequency}>
+                <option value="weekly">Weekly</option>
+                <option value="biweekly">Every 2 weeks</option>
+                <option value="monthly">Monthly</option>
+                <option value="quarterly">Quarterly</option>
+                <option value="annual">Annual</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Starting</label>
+              <input type="date" bind:value={formStartDate} />
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Generate for</label>
+            <select bind:value={formDurationMonths}>
+              <option value={3}>3 months</option>
+              <option value={6}>6 months</option>
+              <option value={12}>1 year</option>
+            </select>
+          </div>
+        {/if}
+      </div>
+
+      <div class="modal-footer">
+        <button class="btn secondary" onclick={closeAddModal}>Cancel</button>
+        <button class="btn primary" onclick={saveNewItem}>Add</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+<!-- Edit Modal -->
+{#if showEditModal && editingItem}
+  <div class="modal-backdrop" onclick={closeEditModal} role="dialog">
+    <div class="modal" onclick={(e) => e.stopPropagation()} role="document">
+      <div class="modal-header">
+        <h2>Edit Item</h2>
+        <button class="modal-close" onclick={closeEditModal}>×</button>
+      </div>
+
+      <div class="modal-form">
+        <div class="form-group">
+          <label>Description</label>
+          <input type="text" bind:value={formDescription} />
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label>Amount</label>
+            <input type="number" bind:value={formAmount} step="0.01" />
+          </div>
+          <div class="form-group type-toggle">
+            <label>Type</label>
+            <div class="toggle-buttons">
+              <button class:active={!formIsIncome} onclick={() => formIsIncome = false}>Expense</button>
+              <button class:active={formIsIncome} onclick={() => formIsIncome = true}>Income</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>Date</label>
+          <input type="date" bind:value={formDate} />
+        </div>
+
+        {#if editingItem.series_id}
+          <p class="series-note">
+            This item is part of a recurring series.
+            Editing only affects this instance.
+          </p>
+        {/if}
+      </div>
+
+      <div class="modal-footer">
+        <button class="btn danger" onclick={() => { deleteItem(editingItem!); closeEditModal(); }}>
+          Delete
+        </button>
+        {#if editingItem.series_id}
+          <button class="btn danger-outline" onclick={() => { deleteItem(editingItem!, true); closeEditModal(); }}>
+            Delete Series
+          </button>
+        {/if}
+        <div class="footer-spacer"></div>
+        <button class="btn secondary" onclick={closeEditModal}>Cancel</button>
+        <button class="btn primary" onclick={saveEditedItem}>Save</button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <style>
   .cashflow-view {
@@ -709,76 +891,111 @@ ORDER BY transaction_date DESC`
   .title {
     font-size: 16px;
     font-weight: 600;
-    color: var(--text-primary);
     margin: 0;
   }
 
-  .count-badge {
-    font-size: 11px;
-    font-weight: 500;
-    color: var(--accent-success, #3fb950);
-    padding: 2px 8px;
-    background: rgba(63, 185, 80, 0.1);
-    border-radius: 10px;
-  }
-
-  .count-badge.expense {
-    color: var(--accent-danger, #f85149);
-    background: rgba(248, 81, 73, 0.1);
-  }
-
-  .hidden-badge {
-    font-size: 11px;
-    font-weight: 500;
-    color: var(--text-muted);
-    padding: 2px 8px;
-    background: var(--bg-tertiary);
-    border-radius: 10px;
-  }
-
-  .header-spacer {
+  .header-spacer, .footer-spacer {
     flex: 1;
   }
 
-  .sql-link, .refresh-btn {
-    padding: 4px 10px;
-    background: var(--bg-tertiary);
-    color: var(--text-secondary);
-    border: 1px solid var(--border-primary);
-    border-radius: 4px;
-    font-size: 12px;
+  .add-btn {
+    padding: 6px 14px;
+    background: var(--accent-primary);
+    color: white;
+    border: none;
+    border-radius: 6px;
+    font-size: 13px;
     font-weight: 500;
     cursor: pointer;
   }
 
-  .sql-link:hover, .refresh-btn:hover:not(:disabled) {
-    background: var(--bg-secondary);
-    color: var(--text-primary);
+  .add-btn:hover {
+    opacity: 0.9;
   }
 
-  .refresh-btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
+  .reset-btn {
+    padding: 4px 10px;
+    background: var(--bg-tertiary);
+    color: var(--text-muted);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    font-size: 11px;
+    cursor: pointer;
   }
 
-  /* Hero Cards */
-  .hero-cards {
+  .reset-btn:hover {
+    color: var(--accent-danger);
+    border-color: var(--accent-danger);
+  }
+
+  /* Account Selector */
+  .account-selector {
     display: flex;
-    gap: var(--spacing-md, 12px);
-    margin-top: var(--spacing-md, 12px);
+    align-items: center;
+    gap: var(--spacing-sm, 8px);
+    margin-top: var(--spacing-sm, 8px);
+    flex-wrap: wrap;
   }
 
-  .hero-card {
+  .account-label {
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  .account-chip {
+    padding: 4px 10px;
     background: var(--bg-tertiary);
     border: 1px solid var(--border-primary);
-    border-radius: 8px;
-    padding: var(--spacing-sm, 8px) var(--spacing-md, 12px);
+    border-radius: 4px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    cursor: pointer;
+  }
+
+  .account-chip:hover {
+    border-color: var(--text-muted);
+  }
+
+  .account-chip.selected {
+    background: var(--accent-primary);
+    border-color: var(--accent-primary);
+    color: white;
+  }
+
+  .balance-display {
+    margin-left: auto;
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+
+  .balance-display strong {
+    color: var(--text-primary);
+    font-family: var(--font-mono, monospace);
+  }
+
+  /* Summary Cards */
+  .summary-cards {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-md, 12px);
+    padding: var(--spacing-md, 12px) var(--spacing-lg, 16px);
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-primary);
+    overflow-x: auto;
+  }
+
+  .summary-card {
     display: flex;
     flex-direction: column;
     gap: 2px;
+    padding: var(--spacing-sm, 8px) var(--spacing-md, 12px);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+    min-width: 90px;
   }
 
-  .hero-label {
+  .card-label {
     font-size: 10px;
     font-weight: 600;
     color: var(--text-muted);
@@ -786,44 +1003,29 @@ ORDER BY transaction_date DESC`
     letter-spacing: 0.5px;
   }
 
-  .hero-value {
-    font-size: 18px;
+  .card-value {
+    font-size: 16px;
     font-weight: 600;
-    color: var(--text-primary);
     font-family: var(--font-mono, monospace);
+    color: var(--text-primary);
   }
 
-  .hero-value.positive {
-    color: var(--accent-success, #3fb950);
-  }
+  .card-value.positive { color: var(--accent-success, #3fb950); }
+  .card-value.negative { color: var(--accent-danger, #f85149); }
+  .card-value.danger { color: var(--accent-danger, #f85149); }
 
-  .hero-value.negative {
-    color: var(--accent-danger, #f85149);
-  }
-
-  .hero-value.danger {
-    color: var(--accent-danger, #f85149);
-  }
-
-  /* Horizon Selector */
   .horizon-selector {
     display: flex;
-    align-items: center;
-    gap: var(--spacing-sm, 8px);
-    margin-top: var(--spacing-sm, 8px);
-  }
-
-  .horizon-label {
-    font-size: 12px;
-    color: var(--text-muted);
+    gap: 4px;
+    margin-left: auto;
   }
 
   .horizon-selector button {
-    padding: 4px 12px;
+    padding: 4px 10px;
     background: var(--bg-tertiary);
     border: 1px solid var(--border-primary);
     border-radius: 4px;
-    font-size: 12px;
+    font-size: 11px;
     color: var(--text-secondary);
     cursor: pointer;
   }
@@ -869,272 +1071,125 @@ ORDER BY transaction_date DESC`
     to { transform: rotate(360deg); }
   }
 
-  .empty-message {
-    font-size: 14px;
+  .empty-title {
+    font-size: 16px;
+    font-weight: 500;
+    color: var(--text-primary);
     margin: 0;
   }
 
   .empty-hint {
-    font-size: 12px;
+    font-size: 13px;
     margin: 0;
-    color: var(--text-muted);
+    text-align: center;
+    max-width: 300px;
   }
 
-  /* Split View */
-  .split-view {
-    flex: 1;
-    display: flex;
-    overflow: hidden;
-    border-bottom: 1px solid var(--border-primary);
+  .empty-add-btn {
+    margin-top: var(--spacing-md, 12px);
+    padding: 10px 20px;
+    background: var(--accent-primary);
+    color: white;
+    border: none;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
   }
 
-  .upcoming-section, .recurring-section {
+  /* Projection Table */
+  .projection-table {
     flex: 1;
     display: flex;
     flex-direction: column;
     overflow: hidden;
   }
 
-  .recurring-section {
-    border-left: 1px solid var(--border-primary);
-  }
-
-  .section-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: var(--spacing-sm, 8px) var(--spacing-md, 12px);
+  .table-header {
+    display: grid;
+    grid-template-columns: 100px 1fr 120px 100px;
+    gap: var(--spacing-md, 12px);
+    padding: var(--spacing-sm, 8px) var(--spacing-lg, 16px);
     background: var(--bg-secondary);
-    border-bottom: 1px solid var(--border-primary);
-  }
-
-  .section-title {
-    font-size: 12px;
+    border-bottom: 2px solid var(--border-primary);
+    font-size: 11px;
     font-weight: 600;
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    margin: 0;
-    padding: var(--spacing-sm, 8px) var(--spacing-md, 12px);
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--border-primary);
   }
 
-  .section-header .section-title {
-    padding: 0;
-    border-bottom: none;
-    background: none;
-  }
-
-  .toggle-hidden {
-    padding: 2px 8px;
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border-primary);
-    border-radius: 4px;
-    font-size: 10px;
-    color: var(--text-muted);
-    cursor: pointer;
-  }
-
-  .toggle-hidden:hover, .toggle-hidden.active {
-    color: var(--text-primary);
-  }
-
-  /* Upcoming List */
-  .upcoming-list {
+  .table-body {
     flex: 1;
     overflow-y: auto;
-    padding: var(--spacing-sm, 8px);
   }
 
-  .upcoming-item {
+  .table-row {
     display: grid;
-    grid-template-columns: 80px 1fr auto;
-    gap: var(--spacing-sm, 8px);
-    padding: var(--spacing-sm, 8px);
+    grid-template-columns: 100px 1fr 120px 100px;
+    gap: var(--spacing-md, 12px);
+    padding: var(--spacing-sm, 8px) var(--spacing-lg, 16px);
     border-bottom: 1px solid var(--border-primary);
     font-size: 13px;
-  }
-
-  .upcoming-item.income {
-    background: rgba(63, 185, 80, 0.05);
-  }
-
-  .upcoming-date {
-    color: var(--text-muted);
-    font-size: 11px;
-  }
-
-  .upcoming-desc {
-    color: var(--text-primary);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .upcoming-amount {
-    font-family: var(--font-mono, monospace);
-    color: var(--accent-danger, #f85149);
-  }
-
-  .upcoming-amount.positive {
-    color: var(--accent-success, #3fb950);
-  }
-
-  /* Recurring List */
-  .recurring-list {
-    flex: 1;
-    overflow-y: auto;
-  }
-
-  .recurring-item {
-    padding: var(--spacing-sm, 8px) var(--spacing-md, 12px);
-    border-bottom: 1px solid var(--border-primary);
     cursor: pointer;
   }
 
-  .recurring-item:hover {
+  .table-row:hover {
     background: var(--bg-secondary);
   }
 
-  .recurring-item.selected {
+  .table-row.selected {
     background: var(--bg-active, rgba(88, 166, 255, 0.1));
   }
 
-  .recurring-item.hidden {
-    opacity: 0.5;
-  }
-
-  .recurring-item.income {
+  .table-row.income {
     border-left: 3px solid var(--accent-success, #3fb950);
   }
 
-  .recurring-item:not(.income) {
+  .table-row:not(.income) {
     border-left: 3px solid var(--accent-danger, #f85149);
   }
 
-  .recurring-main {
+  .col-date {
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+
+  .col-desc {
     display: flex;
-    justify-content: space-between;
     align-items: center;
-  }
-
-  .recurring-desc {
-    font-size: 13px;
-    font-weight: 500;
+    gap: var(--spacing-sm, 8px);
     color: var(--text-primary);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    font-weight: 500;
   }
 
-  .recurring-freq {
-    font-size: 10px;
-    color: var(--accent-primary);
-    background: var(--bg-tertiary);
+  .series-badge {
+    font-size: 9px;
     padding: 2px 6px;
-    border-radius: 4px;
+    background: var(--bg-tertiary);
+    color: var(--text-muted);
+    border-radius: 3px;
     text-transform: uppercase;
   }
 
-  .recurring-meta {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-top: 4px;
-  }
-
-  .recurring-amount {
-    font-size: 12px;
+  .col-amount {
+    text-align: right;
     font-family: var(--font-mono, monospace);
     color: var(--accent-danger, #f85149);
   }
 
-  .recurring-amount.positive {
+  .col-amount.positive {
     color: var(--accent-success, #3fb950);
   }
 
-  .recurring-next {
-    font-size: 11px;
-    color: var(--text-muted);
-  }
-
-  .recurring-actions {
-    display: flex;
-    gap: var(--spacing-sm, 8px);
-    margin-top: var(--spacing-sm, 8px);
-  }
-
-  .recurring-actions button {
-    padding: 4px 10px;
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border-primary);
-    border-radius: 4px;
-    font-size: 11px;
-    color: var(--text-secondary);
-    cursor: pointer;
-  }
-
-  .recurring-actions button:hover {
-    background: var(--bg-secondary);
-    color: var(--text-primary);
-  }
-
-  /* Timeline */
-  .timeline-section {
-    padding: var(--spacing-md, 12px);
-    background: var(--bg-secondary);
-  }
-
-  .timeline-section .section-title {
-    padding: 0 0 var(--spacing-sm, 8px) 0;
-    background: none;
-    border-bottom: none;
-  }
-
-  .timeline {
-    display: flex;
-    gap: var(--spacing-md, 12px);
-    overflow-x: auto;
-    padding: var(--spacing-sm, 8px) 0;
-  }
-
-  .timeline-point {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 2px;
-    padding: var(--spacing-sm, 8px);
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border-primary);
-    border-radius: 6px;
-    min-width: 80px;
-  }
-
-  .timeline-point.danger {
-    border-color: var(--accent-danger, #f85149);
-    background: rgba(248, 81, 73, 0.1);
-  }
-
-  .timeline-date {
-    font-size: 10px;
-    color: var(--text-muted);
-  }
-
-  .timeline-balance {
-    font-size: 14px;
-    font-weight: 600;
+  .col-balance {
+    text-align: right;
     font-family: var(--font-mono, monospace);
-    color: var(--text-primary);
+    font-weight: 600;
   }
 
-  .timeline-point.danger .timeline-balance {
+  .col-balance.danger {
     color: var(--accent-danger, #f85149);
-  }
-
-  .timeline-txns {
-    font-size: 9px;
-    color: var(--text-muted);
   }
 
   /* Keyboard Hints */
@@ -1163,5 +1218,238 @@ ORDER BY transaction_date DESC`
     border-radius: 3px;
     font-family: var(--font-mono, monospace);
     font-size: 10px;
+  }
+
+  /* Modal */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+  }
+
+  .modal {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: 8px;
+    width: 500px;
+    max-width: 95vw;
+    max-height: 85vh;
+    overflow-y: auto;
+  }
+
+  .modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: var(--spacing-md, 12px) var(--spacing-lg, 16px);
+    border-bottom: 1px solid var(--border-primary);
+  }
+
+  .modal-header h2 {
+    font-size: 16px;
+    font-weight: 600;
+    margin: 0;
+  }
+
+  .modal-close {
+    background: none;
+    border: none;
+    font-size: 24px;
+    color: var(--text-muted);
+    cursor: pointer;
+    line-height: 1;
+  }
+
+  .modal-close:hover {
+    color: var(--text-primary);
+  }
+
+  /* Suggestions */
+  .suggestions-section {
+    padding: var(--spacing-md, 12px) var(--spacing-lg, 16px);
+    border-bottom: 1px solid var(--border-primary);
+  }
+
+  .suggestions-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    margin: 0 0 var(--spacing-sm, 8px) 0;
+  }
+
+  .suggestions-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 200px;
+    overflow-y: auto;
+  }
+
+  .suggestion-item {
+    display: grid;
+    grid-template-columns: 1fr auto auto;
+    gap: var(--spacing-md, 12px);
+    padding: var(--spacing-sm, 8px);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    font-size: 12px;
+    cursor: pointer;
+    text-align: left;
+  }
+
+  .suggestion-item:hover {
+    border-color: var(--accent-primary);
+  }
+
+  .suggestion-desc {
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .suggestion-amount {
+    font-family: var(--font-mono, monospace);
+    color: var(--accent-danger, #f85149);
+  }
+
+  .suggestion-amount.positive {
+    color: var(--accent-success, #3fb950);
+  }
+
+  .suggestion-freq {
+    color: var(--text-muted);
+  }
+
+  /* Form */
+  .modal-form {
+    padding: var(--spacing-lg, 16px);
+  }
+
+  .form-group {
+    margin-bottom: var(--spacing-md, 12px);
+  }
+
+  .form-group label {
+    display: block;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    margin-bottom: 4px;
+  }
+
+  .form-group input,
+  .form-group select {
+    width: 100%;
+    padding: 8px 10px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-size: 13px;
+  }
+
+  .form-group input:focus,
+  .form-group select:focus {
+    outline: none;
+    border-color: var(--accent-primary);
+  }
+
+  .form-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--spacing-md, 12px);
+  }
+
+  .toggle-buttons {
+    display: flex;
+    gap: 4px;
+  }
+
+  .toggle-buttons button {
+    flex: 1;
+    padding: 8px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    cursor: pointer;
+  }
+
+  .toggle-buttons button:hover {
+    background: var(--bg-secondary);
+  }
+
+  .toggle-buttons button.active {
+    background: var(--accent-primary);
+    border-color: var(--accent-primary);
+    color: white;
+  }
+
+  .series-note {
+    font-size: 12px;
+    color: var(--text-muted);
+    background: var(--bg-tertiary);
+    padding: var(--spacing-sm, 8px);
+    border-radius: 4px;
+    margin: 0;
+  }
+
+  /* Modal Footer */
+  .modal-footer {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm, 8px);
+    padding: var(--spacing-md, 12px) var(--spacing-lg, 16px);
+    border-top: 1px solid var(--border-primary);
+  }
+
+  .btn {
+    padding: 8px 16px;
+    border-radius: 4px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    border: none;
+  }
+
+  .btn.primary {
+    background: var(--accent-primary);
+    color: white;
+  }
+
+  .btn.primary:hover {
+    opacity: 0.9;
+  }
+
+  .btn.secondary {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-primary);
+    color: var(--text-primary);
+  }
+
+  .btn.secondary:hover {
+    background: var(--bg-primary);
+  }
+
+  .btn.danger {
+    background: var(--accent-danger, #f85149);
+    color: white;
+  }
+
+  .btn.danger-outline {
+    background: transparent;
+    border: 1px solid var(--accent-danger, #f85149);
+    color: var(--accent-danger, #f85149);
+  }
+
+  .btn.danger-outline:hover {
+    background: rgba(248, 81, 73, 0.1);
   }
 </style>
