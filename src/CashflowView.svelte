@@ -1343,15 +1343,37 @@ LIMIT 20`;
     margin-bottom: 4px;
   }
 
-  .form-group input,
-  .form-group select {
+  .form-group input {
     width: 100%;
-    padding: 8px 10px;
+    padding: 8px;
     background: var(--bg-primary);
     border: 1px solid var(--border-primary);
     border-radius: 4px;
     color: var(--text-primary);
     font-size: 13px;
+  }
+
+  .form-group select {
+    width: 100%;
+    padding: 8px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-size: 13px;
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%239ca3af' d='M2 4l4 4 4-4'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
+    padding-right: 28px;
+    cursor: pointer;
+  }
+
+  .form-group select option {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    padding: 8px;
   }
 
   .form-group input:focus,
