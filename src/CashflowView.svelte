@@ -273,14 +273,12 @@ merchant_stats AS (
   FROM merchant_intervals mi
   GROUP BY mi.merchant_group, mi.norm_amount
   HAVING
-    COUNT(*) >= 2
+    COUNT(*) >= 1
     AND AVG(mi.interval_days) BETWEEN 5 AND 400
-    AND STDDEV(mi.interval_days) < AVG(mi.interval_days) * 0.5
 )
 SELECT description, avg_amount, occurrence_count, avg_interval, last_date
 FROM merchant_stats
-ORDER BY ABS(avg_amount) DESC
-LIMIT 50`;
+ORDER BY occurrence_count DESC, ABS(avg_amount) DESC`;
 
   async function loadSuggestions() {
     try {
