@@ -167,16 +167,26 @@
 
   async function loadAccounts() {
     try {
-      // Get accounts with computed balance from transactions
+      // Get asset accounts (checking, savings) with balance from snapshots
+      // Credit cards are liabilities and excluded from cash flow projection
       const rows = await sdk.query<any>(`
+        WITH latest_snapshots AS (
+          SELECT
+            account_id,
+            balance,
+            ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY snapshot_time DESC) as rn
+          FROM balance_snapshots
+        )
         SELECT
-          account_id,
-          account_name,
-          SUM(amount) as balance
-        FROM transactions
-        WHERE account_id IS NOT NULL
-        GROUP BY account_id, account_name
-        ORDER BY account_name
+          a.account_id,
+          COALESCE(a.nickname, a.name) as display_name,
+          COALESCE(s.balance, 0) as balance,
+          a.account_type
+        FROM accounts a
+        LEFT JOIN latest_snapshots s ON a.account_id = s.account_id AND s.rn = 1
+        WHERE a.account_type IS NULL
+           OR LOWER(a.account_type) NOT IN ('credit', 'loan', 'credit card')
+        ORDER BY COALESCE(a.nickname, a.name)
       `);
       accounts = rows.map((r: any) => ({
         id: r[0] as string,
