@@ -6,15 +6,12 @@ export const plugin: Plugin = {
   manifest: {
     id: "treeline-cashflow",
     name: "Cash Flow",
-    version: "0.1.0",
-    description: "Project your future account balance based on recurring income and expenses",
+    version: "0.2.0",
+    description: "Plan your future balance by scheduling expected income and expenses",
     author: "Treeline",
     permissions: {
       tables: {
-        write: [
-          "sys_plugin_treeline_cashflow_scheduled",
-          "sys_plugin_treeline_cashflow_hidden",
-        ],
+        write: ["sys_plugin_treeline_cashflow_items"],
       },
     },
   },

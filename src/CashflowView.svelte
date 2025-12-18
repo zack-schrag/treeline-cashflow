@@ -116,8 +116,6 @@
     cursorIndex < projectedItems.length ? projectedItems[cursorIndex] : null
   );
 
-  // Check if in demo mode (for reset button)
-  let isDemoMode = $state(false);
 
   // Lifecycle
   let unsubscribe: (() => void) | null = null;
@@ -126,14 +124,6 @@
     unsubscribe = sdk.onDataRefresh(() => {
       loadData();
     });
-
-    // Check demo mode
-    try {
-      const result = await sdk.query<any>("SELECT 1 FROM sys_config WHERE key = 'demo_mode' AND value = 'true'");
-      isDemoMode = result.length > 0;
-    } catch {
-      isDemoMode = false;
-    }
 
     await ensureTable();
     await loadAccounts();
@@ -585,9 +575,7 @@ LIMIT 20`;
     <div class="title-row">
       <h1 class="title">Cash Flow</h1>
       <div class="header-spacer"></div>
-      {#if isDemoMode}
-        <button class="reset-btn" onclick={resetPluginData}>Reset Data</button>
-      {/if}
+      <button class="reset-btn" onclick={resetPluginData}>Reset Data</button>
       <button class="add-btn" onclick={() => openAddModal()}>+ Add</button>
     </div>
 
