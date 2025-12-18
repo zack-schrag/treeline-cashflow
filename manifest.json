@@ -1,14 +1,15 @@
 {
   "id": "treeline-cashflow",
-  "name": "Treeline Cashflow",
+  "name": "Cash Flow",
   "version": "0.1.0",
-  "description": "An example plugin demonstrating the Treeline plugin SDK",
-  "author": "Your Name",
+  "description": "Project your future account balance based on recurring income and expenses",
+  "author": "Treeline",
   "main": "index.js",
   "permissions": {
     "tables": {
       "write": [
-        "sys_plugin_treeline_cashflow"
+        "sys_plugin_treeline_cashflow_scheduled",
+        "sys_plugin_treeline_cashflow_hidden"
       ]
     }
   }
