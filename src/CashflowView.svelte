@@ -273,9 +273,9 @@ merchant_stats AS (
   FROM merchant_intervals mi
   GROUP BY mi.merchant_group, mi.norm_amount
   HAVING
-    COUNT(*) >= 2
+    COUNT(*) >= 1
     AND AVG(mi.interval_days) BETWEEN 5 AND 400
-    AND (STDDEV(mi.interval_days) IS NULL OR STDDEV(mi.interval_days) < AVG(mi.interval_days) * 0.7)
+    AND (STDDEV(mi.interval_days) IS NULL OR STDDEV(mi.interval_days) < AVG(mi.interval_days) * 0.8)
 )
 SELECT description, avg_amount, occurrence_count, avg_interval, last_date
 FROM merchant_stats
