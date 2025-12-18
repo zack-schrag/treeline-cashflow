@@ -1,0 +1,15 @@
+{
+  "id": "treeline-cashflow",
+  "name": "Treeline Cashflow",
+  "version": "0.1.0",
+  "description": "An example plugin demonstrating the Treeline plugin SDK",
+  "author": "Your Name",
+  "main": "index.js",
+  "permissions": {
+    "tables": {
+      "write": [
+        "sys_plugin_treeline_cashflow"
+      ]
+    }
+  }
+}
